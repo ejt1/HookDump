@@ -624,6 +624,162 @@ namespace zp
 }
 
 
+// -----------------------------------------------------------------
+// https://dimitrifourny.github.io/2020/06/11/dumping-veh-win10.html
+// -----------------------------------------------------------------
+#define ROR(x, y) ((unsigned)(x) >> (y) | (unsigned)(x) << 32 - (y))
+#define PROCESS_COOKIE 36
+
+uintptr_t GetProcessCookie()
+{
+    ULONG cookie = 0;
+    ULONG return_length = 0;
+    using NtQueryInformationProcess_t = decltype(&NtQueryInformationProcess);
+    HMODULE ntdll = LoadLibraryA("ntdll.dll");
+    spdlog::debug("ntdll: 0x{:X}", reinterpret_cast<uintptr_t>(ntdll));
+
+    NtQueryInformationProcess_t _NtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcess_t>(
+        GetProcAddress(ntdll, "NtQueryInformationProcess"));
+    spdlog::debug("NtQueryInformationProcess: 0x{:X}", reinterpret_cast<uintptr_t>(_NtQueryInformationProcess));
+
+    NTSTATUS success = _NtQueryInformationProcess(
+        GetCurrentProcess(), static_cast<PROCESSINFOCLASS>(PROCESS_COOKIE), &cookie, sizeof(cookie), &return_length);
+    if (success < 0) {
+        return 0;
+    }
+    return cookie;
+}
+
+uintptr_t DecodePointer(uintptr_t cookie, uintptr_t pointer)
+{
+    unsigned char shift_size = 0x20 - (cookie & 0x1f);
+    return ROR(pointer, shift_size) ^ cookie;
+}
+
+typedef struct _VECTORED_HANDLER_ENTRY
+{
+    _VECTORED_HANDLER_ENTRY* next;
+    _VECTORED_HANDLER_ENTRY* previous;
+    ULONG refs;
+    PVECTORED_EXCEPTION_HANDLER handler;
+} VECTORED_HANDLER_ENTRY;
+
+typedef struct _VECTORED_HANDLER_LIST
+{
+    void* mutex_exception;
+    VECTORED_HANDLER_ENTRY* first_exception_handler;
+    VECTORED_HANDLER_ENTRY* last_exception_handler;
+    void* mutex_continue;
+    VECTORED_HANDLER_ENTRY* first_continue_handler;
+    VECTORED_HANDLER_ENTRY* last_continue_handler;
+} VECTORED_HANDLER_LIST;
+
+BYTE* SearchPattern(BYTE* start, size_t length, const BYTE* pattern, const char* mask)
+{
+    for (BYTE* p1 = start; p1 < start + length; ++p1)
+    {
+        size_t i = 0;
+        bool found = true;
+        while (mask[i] != '\0')
+        {
+            if (p1[i] != '?' && p1[i] != pattern[i])
+            {
+                found = false;
+                break;
+            }
+
+            ++i;
+        }
+
+        if (found)
+            return p1;
+    }
+
+    return nullptr;
+}
+
+uintptr_t GetVEHOffset()
+{
+    HMODULE ntdll = LoadLibraryA("ntdll.dll");
+    spdlog::debug("ntdll: 0x{:X}", reinterpret_cast<uintptr_t>(ntdll));
+
+    BYTE* add_exception_handler = reinterpret_cast<BYTE*>(
+        GetProcAddress(ntdll, "RtlAddVectoredExceptionHandler"));
+    spdlog::debug("RtlAddVectoredExceptionHandler: 0x{:X}", reinterpret_cast<uintptr_t>(add_exception_handler));
+
+    BYTE* add_exception_handler_sub = add_exception_handler + 0x16;
+    spdlog::debug("RtlpAddVectoredExceptionHandler: 0x{:X}", reinterpret_cast<uintptr_t>(add_exception_handler_sub));
+    //RtlpCallVectoredHandlers
+    BYTE* RtlCallVectoredHandlers = reinterpret_cast<BYTE*>(
+        GetProcAddress(ntdll, "RtlCallVectoredHandlers"));
+    spdlog::debug("RtlCallVectoredHandlers: 0x{:X}", reinterpret_cast<uintptr_t>(RtlCallVectoredHandlers));
+
+    const BYTE pattern_list[] = {
+        0x83, 0xE0, 0x00, 0x48, 0x8D, 0x3D
+    };
+    const char mask_list[] = "xx?xxx";
+    BYTE* match_list = SearchPattern(add_exception_handler_sub, 0x300, pattern_list, mask_list);
+    if (!match_list)
+    {
+        spdlog::error("Could not find LdrpVectorHandlerList");
+        return 0;
+    }
+    spdlog::debug("LdrpVectorHandlerList 0x{:X}", reinterpret_cast<uintptr_t>((BYTE*)match_list));
+    uint32_t veh_list = *reinterpret_cast<uint32_t*>(match_list + 6) + 10; // 10 = pattern length + sizeof(uint32_t)
+    uintptr_t veh_list_offset = reinterpret_cast<uintptr_t>(match_list) + veh_list - reinterpret_cast<uintptr_t>(ntdll);
+    spdlog::debug("LdrpVectorHandlerList: 0x{:X} (ntdll+0x{:X})\n", static_cast<uintptr_t>(veh_list),
+           veh_list_offset);
+
+    return veh_list_offset;
+}
+
+void DumpVEH()
+{
+    uintptr_t processCookie = GetProcessCookie();
+    spdlog::debug("[-] Process cookie: 0x{:X}", processCookie);
+
+    uintptr_t ntdll = reinterpret_cast<uintptr_t>(GetModuleHandle("ntdll.dll"));
+    VECTORED_HANDLER_LIST* handler_list;
+    uintptr_t veh_offset = GetVEHOffset();
+    if (veh_offset == 0)
+        return;
+    uintptr_t veh_addr = ntdll + GetVEHOffset();
+    spdlog::debug("VEH: 0x{:X}", veh_addr);
+    handler_list = reinterpret_cast<VECTORED_HANDLER_LIST*>(veh_addr);
+
+    spdlog::debug("First entry: 0x{:X}", reinterpret_cast<uintptr_t>(handler_list->first_exception_handler));
+    spdlog::debug("Last entry: 0x{:X}", reinterpret_cast<uintptr_t>(handler_list->last_exception_handler));
+
+    if (reinterpret_cast<uintptr_t>(handler_list->first_exception_handler) ==
+        veh_addr + sizeof(uintptr_t)) {
+        spdlog::info("VEH list is empty");
+        return;
+    }
+
+    spdlog::info("Dumping the entries:");
+    VECTORED_HANDLER_ENTRY* entry = handler_list->first_exception_handler;
+    while (true) {
+        uintptr_t handler = reinterpret_cast<uintptr_t>(entry->handler);
+        spdlog::info("  handler = 0x{:X} => 0x{:X}", handler,
+               DecodePointer(processCookie, handler));
+
+        if (reinterpret_cast<uintptr_t>(entry->next) == veh_addr + sizeof(uintptr_t)) {
+            break;
+        }
+        entry = entry->next;
+    }
+}
+// -----------------------------------------------------------------
+// https://dimitrifourny.github.io/2020/06/11/dumping-veh-win10.html
+// -----------------------------------------------------------------
+
+
+
+LONG TestExceptionFilter(UNUSED PEXCEPTION_POINTERS ep)
+{
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 DWORD __stdcall WorkerThread(LPVOID lpThreadParameter)
 {
     HMODULE hModule = static_cast<HMODULE>(lpThreadParameter);
@@ -636,15 +792,26 @@ DWORD __stdcall WorkerThread(LPVOID lpThreadParameter)
     std::filesystem::path log_file = working_directory / "hook_dump.txt";
 
     spdlog::set_default_logger(spdlog::basic_logger_st("core", log_file.string(), true));
+    BOOL bVerbose = FALSE;
+#ifdef DEBUG
+    bVerbose = TRUE;
+    spdlog::set_level(spdlog::level::debug);
+#endif
+    spdlog::flush_on(spdlog::level::trace); // Flush after every message
 
+    // Unhandled exception filter
+    LPTOP_LEVEL_EXCEPTION_FILTER oldFilter = SetUnhandledExceptionFilter(TestExceptionFilter);
+    if (oldFilter != NULL)
+        spdlog::info("[+] Top-level exception filter 0x{:X}", reinterpret_cast<uintptr_t>(oldFilter));
+    SetUnhandledExceptionFilter(oldFilter);
+
+    // VEH
+    DumpVEH();
+
+    // Hooks
     using namespace zp;
 
     DWORD count = 0;
-    BOOL bVerbose = FALSE;
-
-#ifdef DEBUG
-    bVerbose = TRUE;
-#endif
 
     for (DWORD x = 0; x < _ARRAYSIZE(g_szLibraryList); ++x)
     {
